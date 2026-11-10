@@ -28,10 +28,20 @@ import (
 // models again; relistFirst is how long after it starts it first does;
 // relistSoon is how soon it asks again after a list left out a pick, as
 // a plugin's service just started may not have listed everything yet.
+//
+// While a pick stays set aside the list is asked for every relistSoon too,
+// for up to relistSoonFor: a vendor that left models out for a while (Kiro
+// lists no Claude model until a waking machine's network is back) lists
+// them again within minutes, not an hour later. The waits are by the wall
+// clock, looked at every relistTick: a timer stops while macOS sleeps, so
+// an hour's wait begun before a night's sleep ended hours after waking.
 var (
-	relistEvery = time.Hour
-	relistFirst = time.Minute
-	relistSoon  = 5 * time.Minute
+	relistEvery   = time.Hour
+	relistFirst   = time.Minute
+	relistSoon    = 5 * time.Minute
+	relistSoonFor = 6 * time.Hour
+	relistTick    = time.Minute
+	relistClock   = time.Now
 )
 
 // relistPlugins asks the plugins for their providers and models again,
@@ -52,30 +62,68 @@ func KeepPluginsListed(ctx context.Context) {
 	before := plugin.Cached()
 	t := time.NewTimer(relistFirst)
 	defer t.Stop()
+	// by the wall clock: when the lists were last asked for, and since
+	// when a pick has been set aside
+	var last, aside time.Time
+	wait := time.Duration(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+		now := relistClock().Round(0)
+		if !last.IsZero() && now.Sub(last) < wait {
+			t.Reset(min(wait-now.Sub(last), relistTick))
+			continue
+		}
+		last = now
 		if len(before) == 0 {
 			before = plugin.Cached()
 		}
-		next := relistEvery
+		wait = relistEvery
 		c, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		now, err := relistPlugins(c)
+		ps, err := relistPlugins(c)
 		cancel()
 		if err != nil {
 			log.Printf("listing the plugins' models again: %s (the last lists stay)", err)
-		} else if now != nil {
-			for id, gone := range dropGonePluginPicks(before, now) {
+		} else if ps != nil {
+			for id, gone := range dropGonePluginPicks(before, ps) {
 				log.Printf("%s: %v left its plugin's list, and its picks until it lists them again", id, gone)
-				next = relistSoon
+				wait = relistSoon
 			}
-			before = keptListed(before, now)
+			before = keptListed(before, ps)
 		}
-		t.Reset(next)
+		switch {
+		case !pluginPicksAside(before):
+			aside = time.Time{}
+		case aside.IsZero():
+			aside = now
+			wait = relistSoon
+		case now.Sub(aside) < relistSoonFor:
+			wait = relistSoon
+		}
+		t.Reset(min(wait, relistTick))
 	}
+}
+
+// pluginPicksAside reports whether a plugin provider listed in ps has
+// picks set aside (Delisted), waiting for its list to have them again.
+func pluginPicksAside(ps []plugin.Provider) bool {
+	f, err := read()
+	if err != nil {
+		return false
+	}
+	ids := map[string]bool{}
+	for _, p := range ps {
+		ids[PluginID(p.ID)] = true
+	}
+	for _, q := range f.Providers {
+		if ids[q.ID] && len(q.Delisted) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // pluginListedIDs is the ids each plugin provider lists, by magpie's id for
